@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Fargate stack running gitpod/openvscode-server with ALB'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select a VPC that allows instances access to the Internet.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select at least two public subnets in the selected VPC.
+  
+  CustomImageURL:
+    Type: String
+    Description: Container image URL with customizations (ex. Connection Token)
+    Default: docker.io/davivcgarcia/openvscode-server-custom:latest
+
+Resources:
+  # SSM Parameter
+  OpenVSCodeServerConnToken:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/openvscode-server/connection-token'
+      Type: String
+      Value: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Description: 'Connection Token (authentication) for OpenVSCode Server'
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: OpenVSCodeServerCluster
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      Family: openvscode-server-task
+      Cpu: '1024'
+      Memory: '4096'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: openvscode-server
+          Image: !Ref CustomImageURL 
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: OPENVSCODE_CONN_TOKEN
+              Value: !Sub '{{resolve:ssm:${OpenVSCodeServerConnToken}}}'
+          HealthCheck:
+            Command: [ "CMD-SHELL", "ss -tupan | grep 0.0.0.0:3000 || exit 1" ]
+            Interval: 30
+            Retries: 3
+            StartPeriod: 10
+            Timeout: 5
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          MountPoints:
+            - SourceVolume: EFSVolume
+              ContainerPath: /home/workspace
+      Volumes:
+        - Name: EFSVolume
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EFSAccessPoint
+              IAM: ENABLED
+          
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: openvscode-server-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableECSManagedTags: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: openvscode-server
+          ContainerPort: 3000
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # Execution Role
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientReadWriteAccess
+  
+  # Task Role (with ReadOnlyAccess managed-policy as example)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  # Security Group for Containers
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenVSCode Server container
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+ # EFS Security Group
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # EFS Filesystem
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+
+  # EFS Mount Target on Public Subnet 1
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+
+  # EFS Mount Target on Public Subnet 2
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+
+  EFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: "/openvscode-server"
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "755"
+
+  # Application Load Balancer
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  # ALB Target Group
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: !Sub
+        - '/?tkn=${ConnectionToken}'
+        - ConnectionToken: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Name: openvscode-server-tg
+      Port: 3000
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200,302
+      TargetType: ip
+      VpcId: !Ref VpcId
+
+  # CloudWatch Logs Group
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/openvscode-server
+      RetentionInDays: 30
+
+Outputs:
+  OpenVSCodeServerDNSName:
+    Description: OpenVSCode Server ALB DNS Name
+    Value: !GetAtt ALB.DNSName
+
+  OpenVSCodeServerAuthToken:
+    Description: OpenVSCode Server Connection Token
+    Value: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+
+  OpenVSCodeServerOneClickURL:
+    Description: Single-click URL for OpenVSCode Server
+    Value: !Sub
+      - 'http://${DNSName}?tkn=${ConnectionToken}'
+      - DNSName: !GetAtt ALB.DNSName
+        ConnectionToken: !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
